@@ -1,0 +1,252 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{xcolor}
+
+\title{\textbf{EE451 Project Proposal:\\Parallelizing a Hybrid Retrieval Pipeline\\for Long-Term Agent Memory}}
+\author{
+    Ziyao Wang \and Aojie Yuan \and Haiyue Zhang \and Weixiao Wang \and Joyce Meng
+}
+\date{Spring 2026}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\textit{Category: Implement and Evaluate}
+\end{center}
+
+% ============================================================================
+\section{Introduction and Motivation}
+% ============================================================================
+
+Modern AI agents rely on long-term memory to retrieve relevant past interactions, tool outputs, and accumulated knowledge. In production systems such as ChatGPT, Claude, and autonomous coding agents, this memory can span hundreds of thousands of interaction records across months of operation. Retrieval over this memory is typically implemented as a \textit{hybrid pipeline} that combines sparse lexical search (BM25 over inverted indices) with dense vector search (approximate nearest neighbors over embeddings), then fuses the candidate lists into a final ranking.
+
+While effective for relevance, this pipeline presents significant parallelization challenges:
+\begin{itemize}[nosep]
+    \item \textbf{Irregular memory access}: BM25 scoring traverses posting lists of varying length, causing unpredictable cache behavior.
+    \item \textbf{Stage heterogeneity}: Sparse retrieval is compute-bound while dense ANN search is memory-bound, creating load imbalance when run concurrently.
+    \item \textbf{Synchronization at fusion}: Candidate lists from independent branches must be merged, requiring barrier synchronization.
+    \item \textbf{Scalability limits}: As the memory store grows from $10^3$ to $10^5$ records, the dominant bottleneck shifts, requiring different optimization strategies at different scales.
+\end{itemize}
+
+This project conducts a systematic parallel systems study of the end-to-end hybrid retrieval pipeline. We implement a complete C++ prototype with multiple parallelization strategies, measure performance across thread counts and corpus sizes, and analyze where speedup is gained and where scaling saturates. Beyond the basic pipeline, we extend the system with single-thread algorithmic optimizations (SIMD, MaxScore pruning), a temporal partitioned index, a three-tier hierarchical memory architecture, and a multi-corpus-size scalability study.
+
+% ============================================================================
+\section{Related Work and Context}
+% ============================================================================
+
+Hybrid retrieval is the dominant paradigm in modern information retrieval. Sparse methods like BM25~\cite{bm25} excel at exact term matching, while dense methods using learned embeddings capture semantic similarity. Systems like ColBERT, RRF-based fusion, and Reciprocal Rank Fusion are standard in both search engines and retrieval-augmented generation (RAG) pipelines.
+
+Existing libraries provide efficient primitives for individual components: HNSWlib for approximate nearest neighbor search, and Lucene/Tantivy for inverted index search. However, these libraries do not address the \textit{end-to-end} parallelization question: how to schedule sparse and dense branches, how to overlap computation with fusion, and how query-level versus intra-query parallelism trade off at different scales.
+
+For agent memory specifically, recent work on MemGPT and LangChain memory modules highlights the need for multi-tier memory architectures (working memory, semantic memory, episodic memory) that mirror cognitive science models. Our project bridges these domains by studying the parallel systems implications of hierarchical agent memory retrieval.
+
+% ============================================================================
+\section{System Architecture}
+% ============================================================================
+
+Our system implements a four-stage retrieval pipeline augmented with domain-specific optimizations for agent memory:
+
+\begin{verbatim}
+    Query -> [Preprocessing] -> [Sparse BM25] -\
+                                                 -> [RRF Fusion] -> Top-k
+             [Preprocessing] -> [Dense HNSW]  -/
+\end{verbatim}
+
+\noindent The full codebase comprises approximately 5,700 lines of C++17 across 13 source files and 13 headers, organized as:
+
+\begin{itemize}[nosep]
+    \item \texttt{sparse\_index}: Inverted index with BM25 scoring, SIMD-accelerated scoring (ARM NEON), and MaxScore pruning.
+    \item \texttt{dense\_index}: HNSW-based approximate nearest neighbor search (via HNSWlib).
+    \item \texttt{fusion}: Reciprocal Rank Fusion (RRF) for merging sparse and dense candidate lists.
+    \item \texttt{pipeline}: Four parallelization strategies (sequential, task-parallel, data-parallel, full-parallel, combined).
+    \item \texttt{temporal\_index}: Time-partitioned inverted index with recency-biased partition selection.
+    \item \texttt{hierarchical\_memory}: Three-tier memory (working/semantic/episodic) with consolidation and decay.
+    \item \texttt{memory\_store}: Agent memory management with importance scoring and recency decay.
+    \item \texttt{corpus\_generator}: Synthetic agent interaction corpus generator with realistic session/turn structure.
+\end{itemize}
+
+% ============================================================================
+\section{Parallelization Strategies}
+% ============================================================================
+
+We study five distinct parallelization strategies, each targeting a different level of the pipeline:
+
+\subsection{Query-Level Parallelism (Full Parallel)}
+Distributes independent queries across threads using \texttt{\#pragma omp parallel for}. Each thread processes a complete query (sparse + dense + fusion) independently. This is the simplest strategy and achieves near-linear speedup because queries are independent.
+
+\subsection{Task Parallelism}
+For each query, runs the sparse and dense retrieval branches concurrently using \texttt{\#pragma omp parallel sections}. The two branches have different computational profiles (sparse is compute-bound; dense is memory-bound), creating a natural task decomposition. Speedup is bounded by the slower branch.
+
+\subsection{Data Parallelism}
+Partitions the BM25 scoring loop across threads. Each thread scores a subset of posting list entries and maintains a local top-$k$ heap. Partial results are merged after a barrier. This reduces per-query latency but incurs synchronization overhead at the merge step.
+
+\subsection{Combined (Nested) Parallelism}
+Combines query-level and intra-query data parallelism using OpenMP nested parallelism (\texttt{omp\_set\_max\_active\_levels(2)}). The outer loop distributes queries across $\sqrt{T}$ threads; each query internally uses $T/\sqrt{T}$ threads for data-parallel BM25 scoring.
+
+\subsection{Cross-Tier Parallel Retrieval}
+In the hierarchical memory architecture, all three memory tiers (working, semantic, episodic) are searched concurrently using \texttt{\#pragma omp parallel sections num\_threads(3)}. Results are merged with tier-specific weighting (working: 1.5$\times$, semantic: 1.2$\times$, episodic: 1.0$\times$).
+
+% ============================================================================
+\section{Single-Thread Optimizations}
+% ============================================================================
+
+Beyond multi-threaded parallelism, we implement three single-thread algorithmic optimizations to study how they interact with and complement parallel strategies:
+
+\subsection{SIMD-Accelerated BM25 (ARM NEON)}
+Vectorizes BM25 term-frequency accumulation using 128-bit NEON intrinsics (\texttt{vld1q\_f32}, \texttt{vfmaq\_f32}), processing 4 scores per cycle. Achieves 6--18$\times$ latency reduction depending on corpus size.
+
+\subsection{MaxScore Pruning}
+Implements the MaxScore algorithm for safe early termination during top-$k$ retrieval. Posting lists are sorted by maximum possible contribution; once the $k$-th best score exceeds the remaining maximum contribution, scoring terminates early. Achieves 8--22$\times$ latency reduction.
+
+\subsection{Temporal Partitioned Index}
+Partitions the inverted index by time windows (e.g., weekly buckets). At query time, only the most recent partitions are searched, exploiting the strong recency bias in agent memory access patterns. At 64K records, this searches only 2.6\% of the corpus while maintaining result quality, achieving 47$\times$ latency reduction that \textit{increases} with corpus size.
+
+% ============================================================================
+\section{Hierarchical Memory Architecture}
+% ============================================================================
+
+To model realistic agent memory, we implement a three-tier hierarchical architecture inspired by cognitive science:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Tier} & \textbf{Name} & \textbf{Analogy} & \textbf{Capacity} \\
+\midrule
+0 & Working Memory  & CPU L1 cache / short-term memory & $\sim$100 records \\
+1 & Semantic Memory & CPU L2 cache / semantic memory   & $\sim$10K entries \\
+2 & Episodic Memory & Main memory / episodic memory     & $\sim$500K records \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Key operations include:
+\begin{itemize}[nosep]
+    \item \textbf{Consolidation}: Clusters episodic records by keyword overlap, merges recurring patterns into semantic entries.
+    \item \textbf{Decay}: Applies exponential forgetting ($\text{effective} = \text{importance} \times e^{-\lambda \cdot \text{age}}$) to episodic records, evicting those below a threshold.
+    \item \textbf{Concurrent access}: Each tier has its own \texttt{std::shared\_mutex}, enabling concurrent reads across tiers and exclusive writes during consolidation/decay.
+\end{itemize}
+
+% ============================================================================
+\section{Experimental Setup}
+% ============================================================================
+
+\subsection{Platform}
+\begin{itemize}[nosep]
+    \item CPU: Apple M-series (ARM64), 4 performance cores, 4 efficiency cores
+    \item Compiler: Apple Clang with \texttt{-O3 -march=native}
+    \item OpenMP: Homebrew libomp
+    \item C++ Standard: C++17
+\end{itemize}
+
+\subsection{Workload}
+\begin{itemize}[nosep]
+    \item \textbf{Corpus}: Synthetically generated agent interaction records with realistic session/turn structure, multiple agent roles (user, assistant, tool\_call, tool\_output, system, planning, observation), and embedded topics.
+    \item \textbf{Benchmark corpus}: 12K records (2,000 sessions $\times$ 6 turns), 100--200 queries.
+    \item \textbf{Scalability study}: 5 corpus sizes from 3.9K to 64K records (500--8,000 sessions).
+    \item \textbf{Thread sweep}: 1, 2, 4, 8, 12 threads.
+    \item \textbf{Embedding dimension}: 128.
+\end{itemize}
+
+\subsection{Metrics}
+\begin{itemize}[nosep]
+    \item End-to-end latency (per-query) and throughput (queries/sec)
+    \item Speedup and parallel efficiency relative to single-thread baseline
+    \item Stage-level timing breakdown (sparse, dense, fusion)
+    \item Scalability with respect to corpus size
+    \item Amdahl's Law analysis (serial fraction estimation)
+    \item Compute-bound vs.\ memory-bound analysis
+    \item Correctness validation (parallel results match sequential within $\epsilon$)
+\end{itemize}
+
+% ============================================================================
+\section{Results Summary}
+% ============================================================================
+
+\subsection{Thread Scaling (12K records, 100 queries)}
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Strategy} & \textbf{2T Speedup} & \textbf{4T Speedup} & \textbf{8T Speedup} & \textbf{12T Speedup} \\
+\midrule
+Task Parallel     & 1.27$\times$ & 1.28$\times$ & 1.30$\times$ & 1.30$\times$ \\
+Data Parallel     & 1.80$\times$ & 1.95$\times$ & 1.56$\times$ & 1.51$\times$ \\
+Full Parallel     & 1.97$\times$ & 3.89$\times$ & 6.72$\times$ & 8.28$\times$ \\
+Combined          & 1.87$\times$ & 3.90$\times$ & 3.50$\times$ & 5.15$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Key observations}:
+\begin{itemize}[nosep]
+    \item Full Parallel achieves 8.28$\times$ at 12 threads (69\% efficiency), the best overall throughput strategy.
+    \item Task Parallel saturates at $\sim$1.3$\times$ because it is bounded by the slower branch (sparse).
+    \item Data Parallel peaks at 4 threads then degrades due to synchronization overhead in the merge step.
+    \item Combined shows diminishing returns from nested parallelism overhead.
+\end{itemize}
+
+\subsection{Scalability Study (3.9K -- 64K records)}
+
+\begin{center}
+\begin{tabular}{rrrrrr}
+\toprule
+\textbf{Corpus} & \textbf{FullPar} & \textbf{Combined} & \textbf{SIMD} & \textbf{MaxScore} & \textbf{Temporal} \\
+\midrule
+3,933   & 4.1$\times$ & 2.5$\times$ & 18.0$\times$ & 21.9$\times$ & 8.0$\times$ \\
+12,135  & 4.0$\times$ & 4.0$\times$ & 6.8$\times$  & 11.8$\times$ & 12.4$\times$ \\
+24,390  & 4.1$\times$ & 7.1$\times$ & 5.7$\times$  & 9.9$\times$  & 19.1$\times$ \\
+39,984  & 4.0$\times$ & 8.7$\times$ & 6.3$\times$  & 8.4$\times$  & 29.6$\times$ \\
+63,621  & 3.4$\times$ & 10.7$\times$ & 6.0$\times$ & 9.2$\times$  & 46.7$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Key insight}: When corpus size grows 16$\times$ (3.9K $\to$ 64K), sequential latency grows 6.1$\times$, but temporal partitioned latency grows only 1.1$\times$ --- achieving near-constant-time retrieval through sub-linear scaling.
+
+\subsection{Amdahl's Law Analysis}
+From the speedup curve, the estimated serial fraction is approximately 7--10\%, yielding a theoretical maximum speedup of $\sim$10--14$\times$. The primary serial bottleneck is the RRF fusion stage, which requires a global merge of candidate lists.
+
+\subsection{Compute-Bound vs.\ Memory-Bound}
+Stage-level analysis reveals that BM25 sparse scoring is compute-bound (benefits from data parallelism) while dense HNSW search is memory-bound (limited by cache misses during graph traversal). At higher thread counts, BM25 latency decreases while HNSW latency remains approximately constant, confirming the memory-bandwidth bottleneck.
+
+% ============================================================================
+\section{Correctness Validation}
+% ============================================================================
+
+All parallel strategies are validated against the sequential baseline. For each query, we verify that:
+\begin{itemize}[nosep]
+    \item The top-1 result matches by document ID or by score (within $\epsilon = 10^{-3}$ for pipeline, $10^{-4}$ for sparse-only), accounting for tie-breaking differences in \texttt{partial\_sort}.
+    \item Kendall-$\tau$ rank correlation of the top-10 list exceeds 0.8.
+\end{itemize}
+All strategies pass 200/200 queries for both top-1 match and rank correlation tests.
+
+% ============================================================================
+\section{Deliverables}
+% ============================================================================
+
+\begin{enumerate}[nosep]
+    \item \textbf{Source code}: Complete C++17 codebase ($\sim$5,700 LOC) with CMake build system.
+    \item \textbf{Benchmark suite}: Automated demo producing CSV outputs and 10 publication-quality plots.
+    \item \textbf{Plots}: Speedup, throughput, efficiency, stage breakdown, latency, Amdahl's Law, memory-bound analysis, scalability (latency, speedup, throughput).
+    \item \textbf{Final report}: Performance analysis with bottleneck identification and scaling discussion.
+\end{enumerate}
+
+% ============================================================================
+\section{Conclusion}
+% ============================================================================
+
+This project demonstrates that hybrid retrieval for agent memory is a rich parallelization problem with multiple interacting bottlenecks. Query-level parallelism (Full Parallel) provides the most consistent throughput scaling (8.3$\times$ at 12 threads), while single-thread algorithmic optimizations (SIMD, MaxScore, temporal partitioning) deliver complementary latency reductions of 6--47$\times$. The temporal partitioned index is particularly significant: it achieves sub-linear scaling with corpus size, meaning retrieval time remains nearly constant as the agent's memory grows --- a critical property for long-running AI agents. The three-tier hierarchical memory architecture adds cognitive-inspired organization with concurrent cross-tier retrieval, further demonstrating task-parallel design patterns.
+
+\begin{thebibliography}{9}
+\bibitem{bm25} Robertson, S. and Zaragoza, H. ``The Probabilistic Relevance Framework: BM25 and Beyond.'' \textit{Foundations and Trends in Information Retrieval}, 3(4), 2009.
+\end{thebibliography}
+
+\end{document}
