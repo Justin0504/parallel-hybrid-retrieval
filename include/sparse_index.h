@@ -2,12 +2,33 @@
 
 #include "common.h"
 #include "tokenizer.h"
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <cmath>
 
 namespace hybrid {
+
+// CSR-style flat view of the inverted index, suitable for GPU upload
+// (contiguous, pointer-friendly) or SIMD kernels. Does not own the
+// original index — safe to construct, consume, discard.
+struct SparseIndexCSR {
+    std::unordered_map<std::string, uint32_t> term_to_id;  // term -> term_id
+    std::vector<uint32_t> posting_offsets;    // [num_terms + 1]  (CSR)
+    std::vector<DocID>    posting_doc_ids;    // [total_postings]
+    std::vector<float>    posting_tfs;        // [total_postings]
+    std::vector<float>    term_idfs;          // [num_terms]
+    std::vector<float>    doc_lengths;        // [num_docs]
+
+    float  k1           = 1.2f;
+    float  b            = 0.75f;
+    float  avg_doc_len  = 0.0f;
+    size_t num_docs     = 0;
+
+    size_t num_terms()      const { return term_idfs.size(); }
+    size_t total_postings() const { return posting_doc_ids.size(); }
+};
 
 // Inverted index with BM25 scoring for sparse lexical retrieval.
 //
@@ -49,6 +70,14 @@ public:
                                             int top_k, int num_threads) const;
 
     size_t num_docs() const { return num_docs_; }
+
+    // Flatten the inverted index into a CSR layout (for GPU upload /
+    // SIMD-friendly host code). O(total_postings) time, O(total_postings)
+    // memory for the returned copy. Safe to call after build().
+    SparseIndexCSR flatten() const;
+
+    // Expose the tokenizer so GPU pipeline can share tokenization logic.
+    const Tokenizer& tokenizer() const { return tokenizer_; }
 
     // Stats for benchmarking.
     struct QueryStats {

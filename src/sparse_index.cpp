@@ -714,4 +714,50 @@ std::vector<ScoredDoc> SparseIndex::query_optimized(
     return merged;
 }
 
+// ============================================================================
+// Flatten to CSR (for GPU / SIMD consumers)
+// ============================================================================
+SparseIndexCSR SparseIndex::flatten() const {
+    SparseIndexCSR csr;
+    csr.k1          = k1;
+    csr.b           = b;
+    csr.avg_doc_len = avg_doc_len_;
+    csr.num_docs    = num_docs_;
+    csr.doc_lengths = doc_lengths_;  // copy
+
+    const size_t num_terms = soa_index_.size();
+    csr.term_to_id.reserve(num_terms);
+    csr.term_idfs.reserve(num_terms);
+    csr.posting_offsets.reserve(num_terms + 1);
+    csr.posting_offsets.push_back(0);
+
+    // Stable order so different runs produce identical CSR layouts
+    // (important when comparing GPU vs CPU results).
+    std::vector<const std::string*> terms;
+    terms.reserve(num_terms);
+    for (const auto& kv : soa_index_) terms.push_back(&kv.first);
+    std::sort(terms.begin(), terms.end(),
+              [](const std::string* a, const std::string* b) { return *a < *b; });
+
+    size_t total_postings = 0;
+    for (const auto* t_ptr : terms) total_postings += soa_index_.at(*t_ptr).doc_ids.size();
+    csr.posting_doc_ids.reserve(total_postings);
+    csr.posting_tfs.reserve(total_postings);
+
+    uint32_t term_id = 0;
+    for (const auto* t_ptr : terms) {
+        const auto& soa = soa_index_.at(*t_ptr);
+        csr.term_to_id[*t_ptr] = term_id++;
+        csr.term_idfs.push_back(soa.idf);
+        csr.posting_doc_ids.insert(csr.posting_doc_ids.end(),
+                                   soa.doc_ids.begin(), soa.doc_ids.end());
+        csr.posting_tfs.insert(csr.posting_tfs.end(),
+                               soa.tfs.begin(), soa.tfs.end());
+        csr.posting_offsets.push_back(
+            static_cast<uint32_t>(csr.posting_doc_ids.size()));
+    }
+
+    return csr;
+}
+
 } // namespace hybrid
