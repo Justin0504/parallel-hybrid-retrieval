@@ -226,26 +226,31 @@ struct SparseIndexGPU::Impl {
     }
 
     void ensure_workspace(size_t batch, int max_terms, int top_k) {
-        if (batch > batch_capacity || num_docs == 0) {
+        bool batch_grew = (batch > batch_capacity);
+        bool terms_grew = (max_terms > max_terms_capacity);
+
+        if (batch_grew || num_docs == 0) {
             cudaFree(d_scores);
             CUDA_CHECK(cudaMalloc(&d_scores, batch * num_docs * sizeof(float)));
             batch_capacity = batch;
         }
-        if (max_terms > max_terms_capacity) {
+        if (batch_grew || terms_grew || !d_query_terms) {
             cudaFree(d_query_terms);
-            CUDA_CHECK(cudaMalloc(&d_query_terms, batch_capacity * max_terms * sizeof(int32_t)));
-            max_terms_capacity = max_terms;
+            int mt = std::max(max_terms, max_terms_capacity);
+            CUDA_CHECK(cudaMalloc(&d_query_terms, batch_capacity * mt * sizeof(int32_t)));
+            max_terms_capacity = mt;
         }
-        if (batch > (size_t)topk_capacity || top_k > topk_capacity) {
-            cudaFree(d_out_ids);
-            cudaFree(d_out_scores);
-            CUDA_CHECK(cudaMalloc(&d_out_ids,    batch * top_k * sizeof(uint32_t)));
-            CUDA_CHECK(cudaMalloc(&d_out_scores, batch * top_k * sizeof(float)));
-            topk_capacity = top_k;
-        }
-        if (!d_query_counts || batch > batch_capacity) {
+        if (batch_grew || !d_query_counts) {
             cudaFree(d_query_counts);
             CUDA_CHECK(cudaMalloc(&d_query_counts, batch_capacity * sizeof(int32_t)));
+        }
+        if (batch_grew || top_k > topk_capacity || !d_out_ids) {
+            cudaFree(d_out_ids);
+            cudaFree(d_out_scores);
+            int tk = std::max(top_k, topk_capacity);
+            CUDA_CHECK(cudaMalloc(&d_out_ids,    batch_capacity * tk * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_out_scores, batch_capacity * tk * sizeof(float)));
+            topk_capacity = tk;
         }
     }
 };
