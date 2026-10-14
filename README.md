@@ -143,3 +143,12 @@ ee451-hybrid-retrieval/
 └── third_party/
     └── hnswlib/                # Header-only ANN library
 ```
+
+<!-- aojieyuan-paper-section -->
+## Related paper
+
+This project is related to **[AgentIR: A Workload-Adaptive Cascade Retrieval Substrate for Long-Term Conversational Memory](https://arxiv.org/abs/2605.25092)** by [Aojie (Justin) Yuan](https://aojieyuan.com), Haiyue Zhang, Shahin Nazarian.
+
+- Paper page (PDF, abstract, BibTeX): https://aojieyuan.com/papers/agentir
+- arXiv: https://arxiv.org/abs/2605.25092
+- Plain-language explainer: https://aojieyuan.com/blog/how-ai-agents-remember-long-conversations · [中文解读](https://aojieyuan.com/zh/blog/how-ai-agents-remember-long-conversations)
